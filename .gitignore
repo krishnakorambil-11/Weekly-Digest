@@ -1,2 +1,11 @@
-﻿credentials.json
+﻿# Tokens & Local Secrets
+.env
 token.json
+credentials.json
+
+# Local App State
+digest_state.json
+
+# Backups & Temporary Files
+*.bak
+__pycache__/
