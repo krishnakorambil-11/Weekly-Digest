@@ -65,10 +65,14 @@ def get_cached_summary():
     ts = state.get("last_checked") or state.get("week_anchor") or ""
     return f"Last updated: {ts}", state["summary_text"]
 
-
 def full_rebuild() -> str:
     config = load_config()
     state = load_state()
+
+    # Guard against retrying full_rebuild if already in backoff
+    if is_in_backoff(state):
+        print("[Info] Skipping full rebuild due to active backoff.")
+        return state.get("summary_text") or "Quota limit reached. Please try again later."
 
     items = canvas_client.fetch_canvas_updates(
         days_back=config.get("lookback_days", 7),
@@ -79,24 +83,26 @@ def full_rebuild() -> str:
     try:
         text = gemini_client.summarize(
             items,
-            model_name=config.get("gemini_model", "gemini-3.6-flash"),
+            model_name=config.get("gemini_model", "gemini-2.5-flash"),
             api_key_env_var=config.get("gemini_api_key_env_var", "GEMINI_API_KEY"),
             days=config.get("lookback_days", 7),
         )
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        save_state(
-            {
-                "summary_text": text,
-                "processed_ids": [i["id"] for i in items],
-                "week_anchor": now,
-                "last_checked": now,
-                "backoff_until": None,
-            }
-        )
+        
+        state.update({
+            "summary_text": text,
+            "processed_ids": [i["id"] for i in items],
+            "week_anchor": now,
+            "last_checked": now,
+            "backoff_until": None,
+        })
+        save_state(state)
         return text
 
     except ResourceExhausted:
         print("[Warning] Hit Gemini quota during full rebuild. Entering backoff.")
+        # Mark as checked so ensure_fresh() won't infinitely loop on startup
+        state["last_checked"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         set_backoff(state)
         return state.get("summary_text") or "Quota limit reached. Please try again later."
 
