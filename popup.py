@@ -7,6 +7,7 @@ Built as a tk.Toplevel off a single persistent, hidden Tk root that main.py owns
 """
 
 import ctypes
+import math
 import re
 import sys
 import threading
@@ -34,6 +35,9 @@ RIGHT_MARGIN = 33
 BOTTOM_MARGIN = 24  # gap above the taskbar/work-area edge
 SLIDE_MS = 160
 SLIDE_STEPS = 24
+SCROLL_MS = 4   # smooth-scroll frame interval
+SCROLL_TAU = 0.09  # glide time constant in seconds (smaller = snappier)
+SCROLL_PX = 90  # pixels per wheel notch
 TICK_MS = 8     # how often new backdrop frames are applied
 STATUS_HOLD_MS = 2500  # how long "Updated" stays visible before fading
 
@@ -319,6 +323,13 @@ def _glass_pill(canvas, x, y, text, command, font, anchor="nw"):
 def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None) -> tk.Toplevel:
     """Builds and slides up an Apple Music inspired flyout window."""
     top = tk.Toplevel(root)
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            top.bind("<Destroy>", lambda e: e.widget is top
+                     and ctypes.windll.winmm.timeEndPeriod(1), add="+")
+        except Exception:
+            pass
     top.withdraw()  # stay hidden until the backdrop is captured
     top.overrideredirect(True)
     top.attributes("-topmost", True)
@@ -407,7 +418,6 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
     view_h = footer_y - 16 - view_top
     view = tk.Canvas(
         canvas, width=view_w, height=view_h, bg=BG, highlightthickness=0, bd=0,
-        yscrollincrement=20,
     )
     canvas.create_window(view_x, view_top, window=view, anchor="nw")
     view._bg_photo = ImageTk.PhotoImage(
@@ -426,9 +436,37 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
     def sync_bg():
         view.coords(bg_id, 0, view.canvasy(0))
 
+    # Smooth scrolling: the wheel moves a target offset; a ~120fps ease-out
+    # loop glides the view toward it (pixel-exact, no per-notch jumps).
+    scroll = {"pos": 0.0, "target": 0.0, "total": 1.0, "running": False, "t": 0.0}
+
+    def _scroll_step():
+        try:
+            now = time.perf_counter()
+            # Time-based easing: same glide speed however uneven the frames are
+            dt = min(now - scroll["t"], 0.05)
+            scroll["t"] = now
+            diff = scroll["target"] - scroll["pos"]
+            if abs(diff) < 0.3:
+                scroll["pos"] = scroll["target"]
+                scroll["running"] = False
+            else:
+                scroll["pos"] += diff * (1 - math.exp(-dt / SCROLL_TAU))
+            view.yview_moveto(scroll["pos"] / scroll["total"])
+            sync_bg()
+            if scroll["running"]:
+                view.after(SCROLL_MS, _scroll_step)
+        except tk.TclError:
+            scroll["running"] = False
+
     def on_wheel(event):
-        view.yview_scroll(int(-event.delta / 120) * 3, "units")
-        sync_bg()
+        max_scroll = max(0.0, scroll["total"] - view_h)
+        scroll["target"] = min(max_scroll, max(
+            0.0, scroll["target"] - event.delta / 120 * SCROLL_PX))
+        if not scroll["running"]:
+            scroll["running"] = True
+            scroll["t"] = time.perf_counter() - SCROLL_MS / 1000
+            _scroll_step()
 
     view.bind("<MouseWheel>", on_wheel)
 
@@ -542,6 +580,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
 
         total = y_off - TILE_GAP + TILE_INSET
         view.configure(scrollregion=(0, 0, view_w, max(total, view_h)))
+        scroll.update(pos=0.0, target=0.0, total=float(max(total, view_h)))
         view.yview_moveto(0)
         sync_bg()
 
@@ -554,7 +593,8 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
     # the Tk images. Each stage only ever keeps the latest frame, so a slow
     # stage drops frames instead of building up lag. Frames where nothing
     # behind the popup changed are skipped.
-    live = {"raw": None, "frame": None, "pos": (final_x, final_y), "run": False}
+    live = {"raw": None, "frame": None, "pos": (final_x, final_y), "run": False,
+            "painted": 0.0, "last": None, "stale_margins": False}
     raw_ready = threading.Event()
 
     def _capture_loop():
@@ -590,11 +630,26 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
                 return
             live["pos"] = (top.winfo_x(), top.winfo_y())
             frame = live["frame"]
+            now = time.perf_counter()
             if frame is not None:
-                live["frame"] = None
-                glass_photo.paste(frame)
-                view._bg_photo.paste(
-                    frame.crop((view_x, view_top, view_x + view_w, view_top + view_h)))
+                scrolling = scroll["running"]
+                # While gliding, scroll frames get priority: only the part of
+                # the backdrop behind the scrolling view is refreshed, at most
+                # ~30x/s. The margins catch up as soon as the glide ends.
+                if not (scrolling and now - live["painted"] < 0.033):
+                    live["frame"] = None
+                    live["painted"] = now
+                    live["last"] = frame
+                    if scrolling:
+                        live["stale_margins"] = True
+                    else:
+                        live["stale_margins"] = False
+                        glass_photo.paste(frame)
+                    view._bg_photo.paste(frame.crop(
+                        (view_x, view_top, view_x + view_w, view_top + view_h)))
+            elif live["stale_margins"] and not scroll["running"] and live["last"] is not None:
+                live["stale_margins"] = False
+                glass_photo.paste(live["last"])
             top.after(TICK_MS, _live_tick)
         except tk.TclError:
             live["run"] = False
