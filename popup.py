@@ -64,6 +64,7 @@ NEW_BG = "#fde8ec"
 # Liquid Glass palette (text sits directly on the blurred glass)
 GLASS_TINT = "#14141a"   # dark frosted tint, ~rgba(20,20,25,0.45) over the blur
 GLASS_TEXT = "#ffffff"
+HEADING_RED = "#ff2d55"  # every heading, incl. the "This Week:" title
 GLASS_SUBTLE = "#d5dae3"
 GLASS_SHADOW = "#0b0d12"
 TILE_RADIUS = 24
@@ -357,7 +358,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
     # ----- header -----
     title_font = tkfont.Font(family="Segoe UI Variable Display", size=22, weight="bold")
     sub_font = tkfont.Font(family="Segoe UI Text", size=13)
-    shadow_text(48, 32, text="This Week:", fill=GLASS_TEXT, font=title_font, anchor="nw")
+    shadow_text(48, 32, text="This Week:", fill=HEADING_RED, font=title_font, anchor="nw")
     sub_y = 32 + title_font.metrics("linespace") + 2
     canvas.create_text(
         48, sub_y, text=subtitle, fill=GLASS_SUBTLE, font=sub_font, anchor="nw")
@@ -448,10 +449,14 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             heading = re.match(r"#{1,6}\s+(.*)", line)
             if heading:
                 sections.append([heading.group(1).strip(), []])
-            elif line:
+            elif line and not re.fullmatch(r"[-*_]{3,}", line.strip()):
                 if not sections:
                     sections.append([None, []])
                 sections[-1][1].append(line)
+        # Drop the model's intro ("Here is a concise digest...") that sits
+        # before the first heading, as long as there are real sections after it
+        if len(sections) > 1 and sections[0][0] is None:
+            sections.pop(0)
         return sections
 
     def render(markdown):
@@ -494,7 +499,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             y = TILE_PAD
             if title:
                 ops.append(("text", text_l, y, title.replace("**", ""), head_font,
-                            GLASS_TEXT, True))
+                            HEADING_RED, True))
                 y += head_font.metrics("linespace") + 10
             for line in lines:
                 if line.startswith(("- ", "* ")):
