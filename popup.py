@@ -68,7 +68,7 @@ NEW_BG = "#fde8ec"
 # Liquid Glass palette (text sits directly on the blurred glass)
 GLASS_TINT = "#14141a"   # dark frosted tint, ~rgba(20,20,25,0.45) over the blur
 GLASS_TEXT = "#ffffff"
-HEADING_RED = "#ff2d55"  # every heading, incl. the "This Week:" title
+HEADING_RED = "#d4213f"  # every heading, incl. the "This Week:" title
 GLASS_SUBTLE = "#d5dae3"
 GLASS_SHADOW = "#0b0d12"
 TILE_RADIUS = 24
