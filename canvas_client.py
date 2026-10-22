@@ -4,11 +4,24 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
 
 import requests
 
 BASE_URL = "https://learn.ontariotechu.ca/api/v1"
 TIMEOUT = 30  # seconds per request
+EASTERN = ZoneInfo("America/New_York")
+
+
+def _to_est(iso: str) -> str:
+    """Converts a Canvas UTC timestamp to Eastern time, e.g. '2026-10-21 11:59 PM EDT'."""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    return dt.astimezone(EASTERN).strftime("%Y-%m-%d %I:%M %p %Z")
 
 
 def _clean_html(raw_html: str) -> str:
@@ -76,7 +89,7 @@ def fetch_canvas_updates(
             "type": "Announcement",
             "course": course_map.get(course_id, "Canvas Course"),
             "title": ann.get("title", "No Title"),
-            "date": ann.get("posted_at", ""),
+            "date": _to_est(ann.get("posted_at", "")),
             "content": _clean_html(ann.get("message", "")),
         })
 
@@ -98,7 +111,7 @@ def fetch_canvas_updates(
                 "type": "Assignment",
                 "course": course_name,
                 "title": assign.get("name", "Untitled Assignment"),
-                "date": assign.get("due_at", ""),
+                "date": _to_est(assign.get("due_at", "")),
                 "content": _clean_html(assign.get("description", "")),
             })
 

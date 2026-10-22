@@ -6,3 +6,4 @@ pystray==0.19.5
 Pillow>=11.1.0
 schedule==1.2.2
 keyboard==0.13.5
+tzdata
