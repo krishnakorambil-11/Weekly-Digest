@@ -445,8 +445,9 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
         sections = []  # [title or None, [lines]]
         for raw in markdown.splitlines():
             line = raw.rstrip()
-            if line.startswith("## ") or line.startswith("# "):
-                sections.append([line.lstrip("# ").strip(), []])
+            heading = re.match(r"#{1,6}\s+(.*)", line)
+            if heading:
+                sections.append([heading.group(1).strip(), []])
             elif line:
                 if not sections:
                     sections.append([None, []])
