@@ -145,6 +145,67 @@ def _scheduler_loop():
         time.sleep(60)
 
 
+# ---------- global hotkey ----------
+
+_MODS = {"ctrl": 0x2, "control": 0x2, "alt": 0x1, "shift": 0x4, "win": 0x8, "windows": 0x8}
+_KEYS = {"`": 0xC0, "grave": 0xC0, "space": 0x20, "tab": 0x09, "esc": 0x1B, "escape": 0x1B}
+
+
+def _parse_hotkey(spec):
+    """'ctrl+`' -> (modifier flags, virtual-key code) for RegisterHotKey."""
+    mods, vk = 0, None
+    for part in (p.strip().lower() for p in spec.split("+")):
+        if part in _MODS:
+            mods |= _MODS[part]
+        elif part in _KEYS:
+            vk = _KEYS[part]
+        elif len(part) == 1 and part.isalnum():
+            vk = ord(part.upper())
+        elif part.startswith("f") and part[1:].isdigit():
+            vk = 0x6F + int(part[1:])
+        else:
+            raise ValueError(f"unsupported key '{part}'")
+    if vk is None:
+        raise ValueError("no key in hotkey")
+    return mods, vk
+
+
+def _hotkey_loop(spec):
+    """Registers the hotkey with RegisterHotKey and pumps its messages.
+
+    Unlike the keyboard library's low-level hook, this keeps working when the
+    app is launched at login (the hook can be dropped or never attach then).
+    Retries until the registration succeeds, since the desktop may not be
+    ready right at startup.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    try:
+        mods, vk = _parse_hotkey(spec)
+    except ValueError as err:
+        print(f"Bad hotkey '{spec}' ({err}); using ctrl+`")
+        mods, vk = 0x2, 0xC0
+
+    for _ in range(30):
+        if user32.RegisterHotKey(None, 1, mods | 0x4000, vk):  # MOD_NOREPEAT
+            break
+        time.sleep(2)
+    else:
+        print("RegisterHotKey failed; falling back to keyboard hook")
+        try:
+            keyboard.add_hotkey(spec, _toggle_digest)
+        except Exception as err:
+            print(f"Could not register global hotkeys: {err}")
+        return
+
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        if msg.message == 0x0312:  # WM_HOTKEY
+            _toggle_digest()
+
+
 # ---------- entry point ----------
 
 def main():
@@ -155,15 +216,7 @@ def main():
     threading.Thread(target=_scheduler_loop, daemon=True).start()
 
     hotkey = summarizer.load_config().get("hotkey", "ctrl+`")
-    print(f"Registering hotkey: {hotkey}")
-    try:
-        keyboard.add_hotkey(hotkey, _toggle_digest)
-    except Exception as err:
-        print(f"Failed to bind {hotkey}, falling back to ctrl+grave: {err}")
-        try:
-            keyboard.add_hotkey("ctrl+grave", _toggle_digest)
-        except Exception as e:
-            print(f"Could not register global hotkeys: {e}")
+    threading.Thread(target=_hotkey_loop, args=(hotkey,), daemon=True).start()
 
     menu = Menu(
         MenuItem("Toggle digest", _toggle_digest, default=True),
