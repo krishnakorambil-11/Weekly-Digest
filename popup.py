@@ -45,7 +45,8 @@ STATUS_HOLD_MS = 2500  # how long "Updated" stays visible before fading
 
 NEW_MARK = "\U0001F195"  # 🆕
 
-# Due items: first click starts a wiggle, second click marks it done
+# Due items: first click starts a wiggle, second click marks it done (or,
+# under Completed, moves it back)
 DONE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "done_items.json")
 DUE_HEADING = re.compile(r"due|deadline", re.IGNORECASE)
 WIGGLE_PX = 4        # how far a selected item slides each way
@@ -606,7 +607,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
 
     def _collapse(item):
         """Slides everything below the removed item up into its space while
-        its tile shrinks, then redraws with the item under Completed. The
+        its tile shrinks, then redraws with the item in its new section. The
         shrinking tile is two crops of its image: the part above the gap,
         cut shorter each frame, and the part below it, riding up."""
         tile = item["tile"]
@@ -666,7 +667,11 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             return
         if key in due["wiggling"]:
             _, offset = due["wiggling"].pop(key)
-            done.add(key)
+            # Due items move to Completed; completed ones move back
+            if key in done:
+                done.discard(key)
+            else:
+                done.add(key)
             _save_done(done)
             due["busy"] = True
             _slide_out(due["items"][key], offset)
@@ -758,7 +763,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
                 if line.startswith(("- ", "* ")):
                     content = line[2:].lstrip()
                     item = None
-                    if is_due:
+                    if is_due or is_completed:
                         due["n"] = due.get("n", 0) + 1
                         item = {"tag": f"due{due['n']}", "top": y, "lines": 1,
                                 "tile": tile_info}
