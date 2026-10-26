@@ -52,6 +52,7 @@ WIGGLE_PX = 4        # how far a selected item slides each way
 WIGGLE_PERIOD = 0.45  # seconds per left-right cycle
 WIGGLE_MS = 12
 SLIDE_OUT_MS = 320   # slide-left when an item is marked done
+COLLAPSE_MS = 240    # items below sliding up into the gap
 
 # Color Palette - Apple Music Light Theme
 BG = "#e8ecef"          # Main flyout frosted background container
@@ -530,11 +531,16 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             sections.pop(0)
         return sections
 
-    # Due items: key -> canvas tag and hit box for the current render, plus
-    # the ones currently wiggling (key -> [start time, current x offset]).
-    due = {"items": {}, "wiggling": {}, "sliding": set(), "running": False,
+    # Due items: key -> its canvas tag, rows and tile for the current render,
+    # plus the ones currently wiggling (key -> [start time, current x offset]).
+    due = {"items": {}, "wiggling": {}, "busy": False, "running": False,
            "markdown": text}
     done = _load_done()
+
+    def _photo_copy(dst, src, x0, y0, x1, y1, to=(0, 0), rule="set"):
+        if x1 > x0 and y1 > y0:
+            view.tk.call(dst, "copy", src, "-from", x0, y0, x1, y1,
+                         "-to", *to, "-compositingrule", rule)
 
     def _wiggle_step():
         try:
@@ -545,56 +551,125 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             for key, state in due["wiggling"].items():
                 start, offset = state
                 new = WIGGLE_PX * math.sin(2 * math.pi * (now - start) / WIGGLE_PERIOD)
-                view.move(due["items"][key][0], new - offset, 0)
+                view.move(due["items"][key]["tag"], new - offset, 0)
                 state[1] = new
             view.after(WIGGLE_MS, _wiggle_step)
         except tk.TclError:
             due["running"] = False
 
-    def _slide_out(key, offset):
-        """Eases the item left past the view's edge, then redraws with it
-        moved into the Completed tile."""
-        tag = due["items"][key][0]
-        bbox = view.bbox(tag)
-        distance = (bbox[2] if bbox else view_w) + 8
-        due["sliding"].add(key)
+    def _animate_for(ms, frame, on_done):
         start = time.perf_counter()
-        moved = [offset]
 
         def step():
             try:
-                t = min(1.0, (time.perf_counter() - start) * 1000 / SLIDE_OUT_MS)
-                x = offset - distance * t ** 3  # ease-in: picks up speed
-                view.move(tag, x - moved[0], 0)
-                moved[0] = x
+                t = min(1.0, (time.perf_counter() - start) * 1000 / ms)
+                frame(t)
                 if t < 1.0:
                     view.after(WIGGLE_MS, step)
                 else:
-                    due["sliding"].discard(key)
-                    render(due["markdown"], keep_scroll=True)
+                    on_done()
             except tk.TclError:
                 pass
 
         step()
 
+    def _slide_out(item, offset):
+        """Eases the item left until it disappears under its tile's left
+        edge. Canvas items can't be clipped, so a copy of the backdrop and
+        the tile's rim is laid over the strip left of the edge to hide it."""
+        tag, tile = item["tag"], item["tile"]
+        edge = TILE_INSET + 2
+        bbox = view.bbox(tag)
+        distance = (bbox[2] if bbox else view_w) - edge
+        y0, y1 = tile["y"] + item["top"] - 4, tile["y"] + item["bottom"]
+        cover = tk.PhotoImage(master=view, width=edge, height=y1 - y0)
+        view.create_image(0, y0, image=cover, anchor="nw", tags=("content", "cover"))
+        moved = [offset]
+
+        def frame(t):
+            # Repainted every frame so it follows the live backdrop
+            cover.blank()
+            r0 = int(y0 - view.canvasy(0))
+            c0, c1 = max(r0, 0), min(r0 + y1 - y0, view_h)
+            _photo_copy(cover, view._bg_photo, 0, c0, edge, c1, to=(0, c0 - r0))
+            _photo_copy(cover, tile["photo"], 0, y0 - tile["y"], 2, y1 - tile["y"],
+                        to=(TILE_INSET, 0), rule="overlay")
+            x = offset - distance * t ** 3  # ease-in: picks up speed
+            view.move(tag, x - moved[0], 0)
+            moved[0] = x
+
+        def finish():
+            view.delete("cover", tag)
+            _collapse(item)
+
+        _animate_for(SLIDE_OUT_MS, frame, finish)
+
+    def _collapse(item):
+        """Slides everything below the removed item up into its space while
+        its tile shrinks, then redraws with the item under Completed. The
+        shrinking tile is two crops of its image: the part above the gap,
+        cut shorter each frame, and the part below it, riding up."""
+        tile = item["tile"]
+        ty, h, w = tile["y"], tile["h"], tile["w"]
+        whole = item["lines"] == tile["lines"]  # nothing left: drop the tile
+        if whole:
+            cut, gap = 0, h + TILE_GAP
+        else:
+            cut, gap = item["top"], item["bottom"] - item["top"]
+        threshold = ty + cut + gap - 1
+        movers = [i for i in view.find_withtag("content")
+                  if min(view.coords(i)[1::2]) >= threshold]
+        view.delete(tile["img"])
+        if whole:
+            view.delete(tile["tag"])
+
+        upper = tk.PhotoImage(master=view, width=w, height=h)
+        pieces = [view.create_image(TILE_INSET, ty, image=upper, anchor="nw",
+                                    tags="content")]
+        lower = None
+        if not whole:
+            lower = tk.PhotoImage(master=view, width=w, height=h - cut - gap)
+            _photo_copy(lower, tile["photo"], 0, cut + gap, w, h)
+            pieces.append(view.create_image(TILE_INSET, ty + cut + gap, image=lower,
+                                            anchor="nw", tags="content"))
+        for piece in pieces:
+            view.tag_raise(piece, bg_id)
+        moved = [0]
+
+        def frame(t):
+            d = round(gap * _ease_out_cubic(t))
+            upper.blank()
+            _photo_copy(upper, tile["photo"], 0, 0, w, min(h, cut + gap - d))
+            if lower is not None:
+                view.coords(pieces[1], TILE_INSET, ty + cut + gap - d)
+            for i in movers:
+                view.move(i, 0, moved[0] - d)
+            moved[0] = d
+
+        def finish():
+            render(due["markdown"], keep_scroll=True)
+            due["busy"] = False
+
+        _animate_for(COLLAPSE_MS, frame, finish)
+
     def _due_at(event):
         x, y = view.canvasx(event.x), view.canvasy(event.y)
-        for key, (_tag, (x0, y0, x1, y1)) in due["items"].items():
+        for key, item in due["items"].items():
+            x0, y0, x1, y1 = item["box"]
             if x0 <= x <= x1 and y0 <= y <= y1:
                 return key
         return None
 
     def on_click(event):
         key = _due_at(event)
-        if key is None:
-            return
-        if key in due["sliding"]:
+        if key is None or due["busy"]:
             return
         if key in due["wiggling"]:
             _, offset = due["wiggling"].pop(key)
             done.add(key)
             _save_done(done)
-            _slide_out(key, offset)
+            due["busy"] = True
+            _slide_out(due["items"][key], offset)
         else:
             due["wiggling"][key] = [time.perf_counter(), 0.0]
             if not due["running"]:
@@ -668,22 +743,27 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
         if completed:
             sections.append(("Completed", completed, False, True))
 
-        for title, lines, is_due, is_completed in sections:
+        for n, (title, lines, is_due, is_completed) in enumerate(sections):
             text_fill = GLASS_SUBTLE if is_completed else GLASS_TEXT
+            tile_info = {"y": y_off, "w": tile_w, "lines": len(lines),
+                         "tag": f"tile{n}", "img": f"tileimg{n}"}
             ops = []
             y = TILE_PAD
             if title:
                 ops.append(("text", text_l, y, title.replace("**", ""), head_font,
                             HEADING_RED, True, None))
                 y += head_font.metrics("linespace") + 10
+            item = None  # the due item that indented lines below belong to
             for line in lines:
                 if line.startswith(("- ", "* ")):
                     content = line[2:].lstrip()
-                    tag = None
+                    item = None
                     if is_due:
-                        key = _item_key(content)
-                        tag = f"due{len(due['items'])}"
-                        top_y = y
+                        due["n"] = due.get("n", 0) + 1
+                        item = {"tag": f"due{due['n']}", "top": y, "lines": 1,
+                                "tile": tile_info}
+                        due["items"][_item_key(content)] = item
+                    tag = item and item["tag"]
                     is_new = NEW_MARK in content
                     content = content.replace(NEW_MARK, "").strip()
                     if is_new:
@@ -694,22 +774,29 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
                         ops.append(("text", text_l, y, "\u2022", base_font, text_fill, False, tag))
                         indent = text_l + 22
                     y = flow(ops, words(content), indent, indent, y, tag, text_fill)
-                    if tag:
-                        due["items"][key] = (tag, (
-                            TILE_INSET + text_l - 8, y_off + top_y - 2,
-                            TILE_INSET + text_r + 8, y_off + y + 2))
                 else:
-                    y = flow(ops, words(line), text_l, text_l, y, fill=text_fill)
+                    if item and line[:1].isspace():
+                        item["lines"] += 1
+                    else:
+                        item = None
+                    y = flow(ops, words(line), text_l, text_l, y,
+                             item and item["tag"], text_fill)
                 y += 4
+                if item:
+                    item["bottom"] = y
+                    item["box"] = (TILE_INSET + text_l - 8, y_off + item["top"] - 2,
+                                   TILE_INSET + text_r + 8, y_off + y - 2)
             tile_h = int(y + TILE_PAD - 4)
 
             tile = ImageTk.PhotoImage(
                 _glass_overlay(tile_w, tile_h, TILE_RADIUS, 0.10, (0.18, 0.02), 0.45))
             view._tile_imgs.append(tile)
-            view.create_image(TILE_INSET, y_off, image=tile, anchor="nw", tags="content")
+            view.create_image(TILE_INSET, y_off, image=tile, anchor="nw",
+                              tags=("content", tile_info["img"]))
+            tile_info.update(h=tile_h, photo=tile)
             ox = TILE_INSET
             for op in ops:
-                tags = ("content", op[-1]) if op[-1] else "content"
+                tags = ("content", tile_info["tag"]) + ((op[-1],) if op[-1] else ())
                 if op[0] == "badge":
                     _, bx, by, bw, bh, _tag = op
                     _round_rect(view, ox + bx, y_off + by, ox + bx + bw, y_off + by + bh,
