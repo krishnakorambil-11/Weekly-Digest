@@ -7,7 +7,9 @@ Built as a tk.Toplevel off a single persistent, hidden Tk root that main.py owns
 """
 
 import ctypes
+import json
 import math
+import os
 import re
 import sys
 import threading
@@ -42,6 +44,14 @@ TICK_MS = 8     # how often new backdrop frames are applied
 STATUS_HOLD_MS = 2500  # how long "Updated" stays visible before fading
 
 NEW_MARK = "\U0001F195"  # 🆕
+
+# Due items: first click starts a wiggle, second click marks it done
+DONE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "done_items.json")
+DUE_HEADING = re.compile(r"due|deadline", re.IGNORECASE)
+WIGGLE_PX = 4        # how far a selected item slides each way
+WIGGLE_PERIOD = 0.45  # seconds per left-right cycle
+WIGGLE_MS = 12
+SLIDE_OUT_MS = 320   # slide-left when an item is marked done
 
 # Color Palette - Apple Music Light Theme
 BG = "#e8ecef"          # Main flyout frosted background container
@@ -110,6 +120,29 @@ def _work_area():
         except Exception:
             pass
     return None
+
+
+def _load_done() -> set:
+    try:
+        with open(DONE_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_done(done: set):
+    try:
+        with open(DONE_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(done), f, indent=2)
+    except OSError as exc:
+        print(f"[Warning] Could not save done items: {exc}")
+
+
+def _item_key(content: str) -> str:
+    """Normalized bullet text, so the NEW badge or bold markers coming and
+    going between digests don't make a done item reappear."""
+    text = content.replace(NEW_MARK, "").replace("*", "")
+    return " ".join(text.split()).lower()
 
 
 def _ease_out_cubic(t: float) -> float:
@@ -497,7 +530,86 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             sections.pop(0)
         return sections
 
-    def render(markdown):
+    # Due items: key -> canvas tag and hit box for the current render, plus
+    # the ones currently wiggling (key -> [start time, current x offset]).
+    due = {"items": {}, "wiggling": {}, "sliding": set(), "running": False,
+           "markdown": text}
+    done = _load_done()
+
+    def _wiggle_step():
+        try:
+            if not due["wiggling"]:
+                due["running"] = False
+                return
+            now = time.perf_counter()
+            for key, state in due["wiggling"].items():
+                start, offset = state
+                new = WIGGLE_PX * math.sin(2 * math.pi * (now - start) / WIGGLE_PERIOD)
+                view.move(due["items"][key][0], new - offset, 0)
+                state[1] = new
+            view.after(WIGGLE_MS, _wiggle_step)
+        except tk.TclError:
+            due["running"] = False
+
+    def _slide_out(key, offset):
+        """Eases the item left past the view's edge, then redraws with it
+        moved into the Completed tile."""
+        tag = due["items"][key][0]
+        bbox = view.bbox(tag)
+        distance = (bbox[2] if bbox else view_w) + 8
+        due["sliding"].add(key)
+        start = time.perf_counter()
+        moved = [offset]
+
+        def step():
+            try:
+                t = min(1.0, (time.perf_counter() - start) * 1000 / SLIDE_OUT_MS)
+                x = offset - distance * t ** 3  # ease-in: picks up speed
+                view.move(tag, x - moved[0], 0)
+                moved[0] = x
+                if t < 1.0:
+                    view.after(WIGGLE_MS, step)
+                else:
+                    due["sliding"].discard(key)
+                    render(due["markdown"], keep_scroll=True)
+            except tk.TclError:
+                pass
+
+        step()
+
+    def _due_at(event):
+        x, y = view.canvasx(event.x), view.canvasy(event.y)
+        for key, (_tag, (x0, y0, x1, y1)) in due["items"].items():
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return key
+        return None
+
+    def on_click(event):
+        key = _due_at(event)
+        if key is None:
+            return
+        if key in due["sliding"]:
+            return
+        if key in due["wiggling"]:
+            _, offset = due["wiggling"].pop(key)
+            done.add(key)
+            _save_done(done)
+            _slide_out(key, offset)
+        else:
+            due["wiggling"][key] = [time.perf_counter(), 0.0]
+            if not due["running"]:
+                due["running"] = True
+                _wiggle_step()
+
+    def on_motion(event):
+        view.configure(cursor="hand2" if _due_at(event) else "")
+
+    view.bind("<Button-1>", on_click)
+    view.bind("<Motion>", on_motion)
+
+    def render(markdown, keep_scroll=False):
+        due["markdown"] = markdown
+        due["items"] = {}
         view.delete("content")
         view._tile_imgs = []
         tile_w = view_w - 2 * TILE_INSET
@@ -505,7 +617,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
         text_r = tile_w - TILE_PAD
         y_off = TILE_INSET
 
-        def flow(ops, tokens, x_start, x_wrap, y):
+        def flow(ops, tokens, x_start, x_wrap, y, tag=None, fill=GLASS_TEXT):
             # Consecutive same-font words share one canvas item; one item per
             # word made every popup open slow.
             cx = x_start
@@ -514,7 +626,7 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             def flush():
                 nonlocal run
                 if run:
-                    ops.append(("text", run[0], run[1], run[3], run[2], GLASS_TEXT, False))
+                    ops.append(("text", run[0], run[1], run[3], run[2], fill, False, tag))
                     run = None
 
             for word, bold in tokens:
@@ -532,28 +644,62 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             flush()
             return y + line_h
 
+        # Checked-off items (and their sub-bullets) leave their due tile and
+        # are listed, muted, in a Completed tile at the very bottom; a due
+        # tile with nothing left in it is dropped.
+        sections, completed = [], []
         for title, lines in parse_sections(markdown):
+            is_due = bool(title and DUE_HEADING.search(title))
+            if is_due:
+                kept, skipping = [], False
+                for line in lines:
+                    if line.startswith(("- ", "* ")):
+                        skipping = _item_key(line[2:]) in done
+                        if skipping:
+                            completed.append(line[:2] + line[2:].replace(NEW_MARK, ""))
+                    elif not line[:1].isspace():
+                        skipping = False
+                    if not skipping:
+                        kept.append(line)
+                if lines and not kept:
+                    continue
+                lines = kept
+            sections.append((title, lines, is_due, False))
+        if completed:
+            sections.append(("Completed", completed, False, True))
+
+        for title, lines, is_due, is_completed in sections:
+            text_fill = GLASS_SUBTLE if is_completed else GLASS_TEXT
             ops = []
             y = TILE_PAD
             if title:
                 ops.append(("text", text_l, y, title.replace("**", ""), head_font,
-                            HEADING_RED, True))
+                            HEADING_RED, True, None))
                 y += head_font.metrics("linespace") + 10
             for line in lines:
                 if line.startswith(("- ", "* ")):
                     content = line[2:].lstrip()
+                    tag = None
+                    if is_due:
+                        key = _item_key(content)
+                        tag = f"due{len(due['items'])}"
+                        top_y = y
                     is_new = NEW_MARK in content
                     content = content.replace(NEW_MARK, "").strip()
                     if is_new:
                         bw = badge_font.measure("NEW") + 16
-                        ops.append(("badge", text_l, y + 3, bw, line_h - 6))
+                        ops.append(("badge", text_l, y + 3, bw, line_h - 6, tag))
                         indent = text_l + bw + 10
                     else:
-                        ops.append(("text", text_l, y, "\u2022", base_font, GLASS_TEXT, False))
+                        ops.append(("text", text_l, y, "\u2022", base_font, text_fill, False, tag))
                         indent = text_l + 22
-                    y = flow(ops, words(content), indent, indent, y)
+                    y = flow(ops, words(content), indent, indent, y, tag, text_fill)
+                    if tag:
+                        due["items"][key] = (tag, (
+                            TILE_INSET + text_l - 8, y_off + top_y - 2,
+                            TILE_INSET + text_r + 8, y_off + y + 2))
                 else:
-                    y = flow(ops, words(line), text_l, text_l, y)
+                    y = flow(ops, words(line), text_l, text_l, y, fill=text_fill)
                 y += 4
             tile_h = int(y + TILE_PAD - 4)
 
@@ -563,25 +709,34 @@ def show_popup(root: tk.Tk, title: str, subtitle: str, text: str, on_check=None)
             view.create_image(TILE_INSET, y_off, image=tile, anchor="nw", tags="content")
             ox = TILE_INSET
             for op in ops:
+                tags = ("content", op[-1]) if op[-1] else "content"
                 if op[0] == "badge":
-                    _, bx, by, bw, bh = op
+                    _, bx, by, bw, bh, _tag = op
                     _round_rect(view, ox + bx, y_off + by, ox + bx + bw, y_off + by + bh,
-                                bh // 2, fill=NEW_ACCENT, outline="", tags="content")
+                                bh // 2, fill=NEW_ACCENT, outline="", tags=tags)
                     view.create_text(ox + bx + bw / 2, y_off + by + bh / 2, text="NEW",
-                                     fill="#ffffff", font=badge_font, tags="content")
+                                     fill="#ffffff", font=badge_font, tags=tags)
                 else:
-                    _, tx, ty, txt, font, fill, shadow = op
+                    _, tx, ty, txt, font, fill, shadow, _tag = op
                     if shadow:
                         view.create_text(ox + tx + 1, y_off + ty + 2, text=txt, font=font,
-                                         fill=GLASS_SHADOW, anchor="nw", tags="content")
+                                         fill=GLASS_SHADOW, anchor="nw", tags=tags)
                     view.create_text(ox + tx, y_off + ty, text=txt, font=font, fill=fill,
-                                     anchor="nw", tags="content")
+                                     anchor="nw", tags=tags)
             y_off += tile_h + TILE_GAP
 
-        total = y_off - TILE_GAP + TILE_INSET
-        view.configure(scrollregion=(0, 0, view_w, max(total, view_h)))
-        scroll.update(pos=0.0, target=0.0, total=float(max(total, view_h)))
-        view.yview_moveto(0)
+        # Items were redrawn at rest; forget wiggles for ones that are gone
+        for key in list(due["wiggling"]):
+            if key in due["items"]:
+                due["wiggling"][key][1] = 0.0
+            else:
+                del due["wiggling"][key]
+
+        total = float(max(y_off - TILE_GAP + TILE_INSET, view_h))
+        view.configure(scrollregion=(0, 0, view_w, total))
+        pos = min(scroll["target"], total - view_h) if keep_scroll else 0.0
+        scroll.update(pos=pos, target=pos, total=total)
+        view.yview_moveto(pos / total)
         sync_bg()
 
     render(text)

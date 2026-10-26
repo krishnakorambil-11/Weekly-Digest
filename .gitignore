@@ -9,3 +9,5 @@ digest_state.json
 # Backups & Temporary Files
 *.bak
 __pycache__/
+# Done-item cache
+done_items.json
